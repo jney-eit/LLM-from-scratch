@@ -19,6 +19,8 @@ class Head(nn.Module):
         """
 
         super().__init__()
+        self.head_size = head_size
+
         # weight matrix to calculate key from input
         self.key = nn.Linear(d_model, head_size, bias=False)
         # weight matrix to calculate query from input
@@ -43,7 +45,7 @@ class Head(nn.Module):
 
         # compute dot product attention: Q * transpose(K) / sqrt(d_model)
         # attention matrix
-        wei = q @ k.transpose(-2, -1) * d_model**-0.5                                               # (batch_size, sequence_length, sequence_length)
+        wei = q @ k.transpose(-2, -1) * self.head_size**-0.5                                               # (batch_size, sequence_length, sequence_length)
         # masked attention matrix
         wei = wei.masked_fill(self.tril[:sequence_length, :sequence_length] == 0, float('-inf'))      # (batch_size, sequence_length, sequence_length)
         wei = F.softmax(wei, dim=-1)                                                                # (batch_size, sequence_length, sequence_length)
@@ -97,6 +99,74 @@ class MultiHeadAttention(nn.Module):
         out = self.proj(out)
         out = self.dropout(out)
         return out
+
+
+
+class CombinedMultiHeadAttention(nn.Module):
+    """ We don't need to calculate the heads separately, we can express them as a single matrix multiplication"""
+
+    def __init__(self, context_length, d_model, head_size, num_heads, dropout=0.0):
+        super().__init__()
+        assert d_model % num_heads == 0, f"d_model must be divisible by num_heads, d_model: {d_model}, num_heads: {num_heads}"
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_size = head_size
+
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+
+        # projection layer to merge information of all heads
+        self.proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        self.register_buffer(
+            "mask",
+            torch.triu(torch.ones(context_length, context_length), diagonal=1),
+            persistent=False
+        )
+
+    def forward(self, x):
+        batch_size, sequence_length, d_model = x.shape
+
+        keys = self.W_k(x)
+        queries = self.W_q(x)
+        values = self.W_v(x)
+
+        # Implicitly split the matrix by adding num_heads dimension
+        keys = keys.view(batch_size, sequence_length, self.num_heads, self.head_size)
+        queries = queries.view(batch_size, sequence_length, self.num_heads, self.head_size)
+        values = values.view(batch_size, sequence_length, self.num_heads, self.head_size)
+
+        # Transpose: (batch_size, sequence_length, num_heads, head_size) -> (batch_size, num_heads, sequence_length, head_size)
+        keys = keys.transpose(1, 2)
+        queries = queries.transpose(1, 2)
+        values = values.transpose(1, 2)
+
+        # Compute scaled dot-prodcut attention
+        attn_scores = queries @ keys.transpose(2, 3)
+
+        # Truncate mask to actual sequence length
+        mask = self.mask.bool()[:sequence_length, :sequence_length]
+
+        # Mask attention scores
+        attn_scores.masked_fill_(mask, -torch.inf)
+
+        # Apply softmax and scaling
+        attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        context_vec = (attn_weights @ values).transpose(1, 2) # (batch_size, sequence_length, num_heads, head_size)
+
+        # Combine heads
+        context_vec = context_vec.contiguous().view(batch_size, sequence_length, self.d_model)
+        context_vec = self.proj(context_vec)
+
+        return context_vec
+
+
+
 
 class TransformerBlock(nn.Module):
     """
@@ -210,62 +280,67 @@ class VanillaGPT(nn.Module):
 
 if __name__ == "__main__":
 
+    """
+    The purpose of this test is to verify that the `MultiHeadAttention` and 
+    `CombinedMultiHeadAttention`  produce identical outputs given the 
+    same inputs and weights. 
+    """
+    print("--- Running Attention Equivalence Test ---")
 
-    B, T, C = 4, 8, 2  # batch, time, channels
-    x = torch.randn(B, T, C)
-    print(x.shape)
+    # Define Hyperparameters for the test
+    batch_size = 4
+    context_length = 64
+    d_model = 128
+    num_heads = 4
+    dropout = 0.0  # Dropout must be 0 for a deterministic comparison
 
-    # We want x[b, t] = mean_{i<=t} x[b, i]
+    # Ensure d_model is divisible by num_heads
+    assert d_model % num_heads == 0
+    head_size = d_model // num_heads
 
-    # Version 1
-    xbow = torch.zeros((B, T, C))           # bow = back of words
-    for b in range(B):
-        for t in range(T):
-            xprev = x[b, :t+1] # (t, C)
-            xbow[b, t] = torch.mean(xprev, 0)
+    print(f"Test Parameters:\n  - Batch Size: {batch_size}\n  - Context Length: {context_length}\n  - D_Model: {d_model}\n  - Num Heads: {num_heads}\n")
 
+    # Instantiate both attention modules with the same parameters
+    mha = MultiHeadAttention(context_length, d_model, d_model // num_heads, num_heads, dropout)
+    combined_mha = CombinedMultiHeadAttention(context_length, d_model, head_size, num_heads, dropout)
 
-    # Version 2
-    wei = torch.tril(torch.ones(T, T))
-    wei = wei / wei.sum(1, keepdim=True)
+    # Set models to evaluation mode
+    mha.eval()
+    combined_mha.eval()
 
-    xbow2 = wei @ x # (T, T) @ (B, T, C) ---> (B, T, C)
+    # Copy weights from the iterative model to the combined model
+    with torch.no_grad():
+        # The W_q, W_k, and W_v matrices in the combined model are equivalent to the
+        # concatenation of the corresponding matrices from each head in the iterative model.
+        combined_mha.W_q.weight.data.copy_(torch.cat([head.query.weight for head in mha.heads], dim=0))
+        combined_mha.W_k.weight.data.copy_(torch.cat([head.key.weight for head in mha.heads], dim=0))
+        combined_mha.W_v.weight.data.copy_(torch.cat([head.value.weight for head in mha.heads], dim=0))
 
-    # Version 3
-    tril = torch.tril(torch.ones(T, T))
-    wei = torch.zeros((T, T))
-    wei = wei.masked_fill(tril == 0, float('-inf'))
-    wei = F.softmax(wei, dim=-1)
-    xbow3 = wei @ x
+        # The final projection layers are equivalent and can be copied directly.
+        combined_mha.proj.weight.data.copy_(mha.proj.weight.data)
+        combined_mha.proj.bias.data.copy_(mha.proj.bias.data)
 
-    print(f"x[0]: {x[0]}")
-    print(f"xbow[1]: {xbow[1]}")
-    print(f"xbow2[1]: {xbow2[1]}")
+    # Create a random input tensor
+    random_input = torch.randn(batch_size, context_length, d_model)
 
-    print(f"xbow same as xbow2? {torch.allclose(xbow, xbow2, rtol=1e-3)}")
-    print(f"xbow same as xbow3? {torch.allclose(xbow, xbow3, rtol=1e-3)}")
+    # Perform the forward pass for both models
+    output_mha = mha(random_input)
+    output_combined_mha = combined_mha(random_input)
 
+    # Compare the outputs
+    are_outputs_equal = torch.allclose(output_mha, output_combined_mha, atol=1e-6)
 
-    # Version 4: self-attention
-    B, T, C = 4, 8, 32
-    x = torch.randn(B, T, C)
+    print(f"Output shape from MultiHeadAttention: {output_mha.shape}")
+    print(f"Output shape from CombinedMultiHeadAttention: {output_combined_mha.shape}\n")
 
-    # let's see a single Head perform self-attention
-    head_size = 16
-    key = nn.Linear(C, head_size, bias=False)
-    query = nn.Linear(C, head_size, bias=False)
-    value = nn.Linear(C, head_size, bias=False)
+    # Report the result
+    if are_outputs_equal:
+        print("SUCCESS: The outputs of MultiHeadAttention and CombinedMultiHeadAttention are the same.")
+    else:
+        print("FAILURE: The outputs are different.")
+        difference = torch.abs(output_mha - output_combined_mha).max().item()
+        print(f"Maximum absolute difference between outputs: {difference}")
 
-    k = key(x)      # (B, T, head_size)
-    q = query(x)    # (B, T, head_size)
-    wei = q @ k.transpose(-2, -1) * head_size**-0.5  # (B, T, head_size) @ (B, 16, T) ---> (B, T, T)
-    tril = torch.tril(torch.ones(T, T))
-    wei = wei.masked_fill(tril == 0, float('-inf'))
-    wei = F.softmax(wei, dim=-1)
-
-    v = value(x)
-    out = wei @ v
-
-
+    print("--- Test Complete ---")
 
 

@@ -3,7 +3,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 from rotary_embedding_torch import RotaryEmbedding
 
-
 # Set a manual seed for reproducibility of results.
 torch.manual_seed(1337)
 
@@ -109,25 +108,36 @@ class MultiHeadAttention(nn.Module):
 
 class CombinedMultiHeadAttention(nn.Module):
     """
-    An optimized implementation of Multi-Head Attention. Instead of calculating heads separately,
-    it performs the key, query, and value projections for all heads in a single matrix multiplication,
-    which is more efficient.
+    An optimized implementation of Multi-Head Attention that supports Grouped Query Attention (GQA).
+    Instead of calculating heads separately, it performs the key, query, and value projections for all heads
+    in a single matrix multiplication, which is more efficient.
+
+    In GQA, query heads are grouped, and each group shares a single key and value head.
+    - If num_kv_heads == num_heads, it's standard Multi-Head Attention (MHA).
+    - If num_kv_heads == 1, it's Multi-Query Attention (MQA).
+    - If 1 < num_kv_heads < num_heads, it's Grouped Query Attention (GQA).
     """
 
-    def __init__(self, context_length, d_model, head_size, num_heads, dropout=0.0, do_use_rotary_emb=False):
+    def __init__(self, context_length, d_model, head_size, num_heads, num_kv_heads, dropout=0.0,
+                 do_use_rotary_emb=False):
         super().__init__()
+
+        # Assertions to ensure the head configuration is valid
         assert d_model % num_heads == 0, f"d_model must be divisible by num_heads, d_model: {d_model}, num_heads: {num_heads}"
+        assert num_heads % num_kv_heads == 0, f"Number of query heads must be divisible by the number of K/V heads, num_heads: {num_heads}, num_kv_heads: {num_kv_heads}"
 
         self.d_model = d_model
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.context_length = context_length
         self.do_use_rotary_emb = do_use_rotary_emb
 
         # Single linear layers for all heads' queries, keys, and values.
-        self.W_q = nn.Linear(d_model, d_model, bias=False)
-        self.W_k = nn.Linear(d_model, d_model, bias=False)
-        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_q = nn.Linear(d_model, d_model, bias=False)  # Query projection remains the same size
+        # Key and Value projections are smaller for GQA
+        self.W_k = nn.Linear(d_model, self.num_kv_heads * self.head_size, bias=False)
+        self.W_v = nn.Linear(d_model, self.num_kv_heads * self.head_size, bias=False)
 
         # Final projection layer.
         self.proj = nn.Linear(d_model, d_model)
@@ -148,9 +158,9 @@ class CombinedMultiHeadAttention(nn.Module):
         batch_size, sequence_length, d_model = x.shape
 
         # Project input to new keys, queries, and values for all heads at once.
-        keys_new = self.W_k(x)
-        queries_new = self.W_q(x)
-        values_new = self.W_v(x)
+        queries_new = self.W_q(x)  # (B, T, num_heads * head_size)
+        keys_new = self.W_k(x)  # (B, T, num_kv_heads * head_size)
+        values_new = self.W_v(x)  # (B, T, num_kv_heads * head_size)
 
         if use_kv_cache:
             # If caching is enabled, append new keys and values to the stored cache.
@@ -176,22 +186,34 @@ class CombinedMultiHeadAttention(nn.Module):
             values = values_new
             queries = queries_new
 
-
         q_len = queries.shape[1]
         kv_len = keys.shape[1]
 
         # Reshape and transpose to separate heads.
+        # Queries: (B, T, d_model) -> (B, T, num_heads, head_size) -> (B, num_heads, T, head_size)
         queries = queries.view(batch_size, q_len, self.num_heads, self.head_size).transpose(1, 2)
-        keys = keys.view(batch_size, kv_len, self.num_heads, self.head_size).transpose(1, 2)
-        values = values.view(batch_size, kv_len, self.num_heads, self.head_size).transpose(1, 2)
+        # Keys: (B, T, num_kv_heads * head_size) -> (B, T, num_kv_heads, head_size) -> (B, num_kv_heads, T, head_size)
+        keys = keys.view(batch_size, kv_len, self.num_kv_heads, self.head_size).transpose(1, 2)
+        # Values: (B, T, num_kv_heads * head_size) -> (B, T, num_kv_heads, head_size) -> (B, num_kv_heads, T, head_size)
+        values = values.view(batch_size, kv_len, self.num_kv_heads, self.head_size).transpose(1, 2)
 
+        # Apply rotary embeddings
         if q_len != kv_len:
             queries, keys = rotary_emb.rotate_queries_with_cached_keys(queries, keys)
         else:
             queries = rotary_emb.rotate_queries_or_keys(queries)
             keys = rotary_emb.rotate_queries_or_keys(keys)
 
+        # Repeat K and V heads to match the number of query heads
+        if self.num_kv_heads != self.num_heads:
+            num_reps = self.num_heads // self.num_kv_heads
+            # keys: (B, num_kv_heads, T, head_size) -> (B, num_heads, T, head_size)
+            keys = keys.repeat_interleave(num_reps, dim=1)
+            # values: (B, num_kv_heads, T, head_size) -> (B, num_heads, T, head_size)
+            values = values.repeat_interleave(num_reps, dim=1)
+
         # Calculate attention scores.
+        # (B, num_heads, T, head_size) @ (B, num_heads, head_size, T) -> (B, num_heads, T, T)
         attn_scores = queries @ keys.transpose(-2, -1)
 
         # Apply causal mask.
@@ -204,6 +226,7 @@ class CombinedMultiHeadAttention(nn.Module):
         attn_weights = self.dropout(attn_weights)
 
         # Get the context vector by multiplying attention weights with values.
+        # (B, num_heads, T, T) @ (B, num_heads, T, head_size) -> (B, num_heads, T, head_size)
         context_vec = (attn_weights @ values).transpose(1, 2)
 
         # Combine heads back into a single tensor.
@@ -224,10 +247,11 @@ class TransformerBlock(nn.Module):
     are used to stabilize training.
     """
 
-    def __init__(self, context_length, d_model, num_heads, dropout=0.0, do_use_rotary_emb=False):
+    def __init__(self, context_length, d_model, num_heads, num_kv_heads, dropout=0.0, do_use_rotary_emb=False):
         super().__init__()
         head_size = d_model // num_heads
-        self.sa = CombinedMultiHeadAttention(context_length, d_model, head_size, num_heads, dropout, do_use_rotary_emb)
+        self.sa = CombinedMultiHeadAttention(context_length, d_model, head_size, num_heads, num_kv_heads, dropout,
+                                             do_use_rotary_emb)
         self.ffwd = FeedForward(d_model, dropout)
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
@@ -249,9 +273,14 @@ class VanillaGPT(nn.Module):
     A simple decoder-only Language Model (LLM) using multi-head self-attention.
     """
 
-    def __init__(self, vocab_size, context_length, d_model, num_heads, n_layer, dropout=0.0, do_use_rotary_emb=False, device='cpu'):
+    def __init__(self, vocab_size, context_length, d_model, num_heads, n_layer, num_kv_heads=None, dropout=0.0, do_use_rotary_emb=False, device='cpu'):
         super().__init__()
         self.device = device
+
+        # If num_kv_heads is not specified, default to standard MHA
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        self.num_kv_heads = num_kv_heads
 
         # Embedding layers for tokens and their positions in the sequence.
         self.token_embedding_layer = nn.Embedding(vocab_size, d_model)
@@ -260,11 +289,14 @@ class VanillaGPT(nn.Module):
         if self.do_use_rotary_emb is False:
             self.position_embedding_layer = nn.Embedding(context_length, d_model)
         else:
-            self.rotary_emb = RotaryEmbedding(dim=32)
+            # The dimension for rotary embeddings must be even and is typically a fraction of the head size
+            rotary_dim = d_model // num_heads
+            self.rotary_emb = RotaryEmbedding(dim=rotary_dim)
 
         # A stack of Transformer blocks.
         self.blocks = nn.ModuleList(
-            [TransformerBlock(context_length, d_model, num_heads, dropout, do_use_rotary_emb=do_use_rotary_emb) for _ in range(n_layer)])
+            [TransformerBlock(context_length, d_model, num_heads, self.num_kv_heads, dropout,
+                              do_use_rotary_emb=do_use_rotary_emb) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(d_model)  # Final layer normalization
 
         # The final linear layer that maps the model's output to vocabulary logits.
@@ -307,7 +339,6 @@ class VanillaGPT(nn.Module):
         else:
             x = tok_emb
 
-
         # Pass through all Transformer blocks.
         for blk in self.blocks:
             if self.do_use_rotary_emb is False:
@@ -334,7 +365,7 @@ class VanillaGPT(nn.Module):
         :param num_tokens_to_generate: The number of new tokens to generate.
         :return: The extended sequence of tokens.
         """
-        self.eval() # Set model to evaluation mode
+        self.eval()  # Set model to evaluation mode
         with torch.no_grad():
             self.reset_kv_cache()
             for _ in range(num_tokens_to_generate):
@@ -360,7 +391,7 @@ class VanillaGPT(nn.Module):
         :param num_tokens_to_generate: The number of new tokens to generate.
         :return: The extended sequence of tokens.
         """
-        self.eval() # Set model to evaluation mode
+        self.eval()  # Set model to evaluation mode
         with torch.no_grad():
             self.reset_kv_cache()
             # First, process the entire prompt to initialize the KV cache.
@@ -391,11 +422,13 @@ if __name__ == "__main__":
     # 1. Define Hyperparameters for the model and test
     batch_size = 1
     context_length = 128
-    d_model = 64
+    d_model = 256
     num_heads = 4
+    num_kv_heads = 2
     n_layer = 4
     vocab_size = 50
     dropout = 0.0  # Dropout must be 0 for a deterministic comparison
+    do_use_rotary_emb = True
     device = 'cpu'
 
     # Generation parameters
@@ -414,7 +447,9 @@ if __name__ == "__main__":
         d_model=d_model,
         num_heads=num_heads,
         n_layer=n_layer,
+        num_kv_heads=num_kv_heads,
         dropout=dropout,
+        do_use_rotary_emb=do_use_rotary_emb,
         device=device
     ).to(device)
 

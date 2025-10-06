@@ -197,7 +197,7 @@ def load_model(config, vocab_size):
         saved_config = yaml.safe_load(config_file)
 
     model = VanillaGPT(vocab_size, saved_config["context_size"], saved_config["d_model"], saved_config["num_heads"],
-                       saved_config["num_layers"], saved_config["dropout"], saved_config["do_use_rotary_emb"], device)
+                       saved_config["num_layers"], num_kv_heads=saved_config["num_kv_heads"], dropout=saved_config["dropout"], do_use_rotary_emb=["do_use_rotary_emb"], device=device)
 
     state_dict = torch.load(str(model_load_path), weights_only=True, map_location=device)
     model.load_state_dict(state_dict)
@@ -219,7 +219,7 @@ def main():
     if config["load_model"] is True:
         model = load_model(config, vocab_size)
     else:
-        model = VanillaGPT(vocab_size, config["context_size"], config["d_model"], config["num_heads"], config["num_layers"], config["dropout"], config["do_use_rotary_emb"], device)
+        model = VanillaGPT(vocab_size, config["context_size"], config["d_model"], config["num_heads"], config["num_layers"], num_kv_heads=config["num_kv_heads"], dropout=config["dropout"], do_use_rotary_emb=["do_use_rotary_emb"], device=device)
         model = model.to(device)
 
         tr = Trainer(model, train_data, val_data, vocab_size, config["context_size"], config["batch_size"], config["train_iters"], config["eval_iters"], loss_function, optimizer, config["learning_rate"], device)

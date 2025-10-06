@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from rotary_embedding_torch import RotaryEmbedding
+
 
 # Set a manual seed for reproducibility of results.
 torch.manual_seed(1337)
@@ -112,7 +114,7 @@ class CombinedMultiHeadAttention(nn.Module):
     which is more efficient.
     """
 
-    def __init__(self, context_length, d_model, head_size, num_heads, dropout=0.0):
+    def __init__(self, context_length, d_model, head_size, num_heads, dropout=0.0, do_use_rotary_emb=False):
         super().__init__()
         assert d_model % num_heads == 0, f"d_model must be divisible by num_heads, d_model: {d_model}, num_heads: {num_heads}"
 
@@ -120,6 +122,7 @@ class CombinedMultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.context_length = context_length
+        self.do_use_rotary_emb = do_use_rotary_emb
 
         # Single linear layers for all heads' queries, keys, and values.
         self.W_q = nn.Linear(d_model, d_model, bias=False)
@@ -141,13 +144,17 @@ class CombinedMultiHeadAttention(nn.Module):
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
 
-    def forward(self, x, use_kv_cache=False):
+    def forward(self, x, use_kv_cache=False, rotary_emb=None):
         batch_size, sequence_length, d_model = x.shape
 
         # Project input to new keys, queries, and values for all heads at once.
         keys_new = self.W_k(x)
         queries_new = self.W_q(x)
         values_new = self.W_v(x)
+
+        #print(f"keys_new shape: {keys_new.shape}")
+        #print(f"queries_new shape: {queries_new.shape}")
+        #print(f"values_new shape: {values_new.shape}")
 
         if use_kv_cache:
             # If caching is enabled, append new keys and values to the stored cache.
@@ -173,6 +180,12 @@ class CombinedMultiHeadAttention(nn.Module):
             values = values_new
             queries = queries_new
 
+
+        #print(f"keys shape: {keys.shape}")
+        #print(f"values shape: {values.shape}")
+        #print(f"queries shape: {queries.shape}")
+
+
         q_len = queries.shape[1]
         kv_len = keys.shape[1]
 
@@ -180,6 +193,19 @@ class CombinedMultiHeadAttention(nn.Module):
         queries = queries.view(batch_size, q_len, self.num_heads, self.head_size).transpose(1, 2)
         keys = keys.view(batch_size, kv_len, self.num_heads, self.head_size).transpose(1, 2)
         values = values.view(batch_size, kv_len, self.num_heads, self.head_size).transpose(1, 2)
+
+        if q_len != kv_len:
+            queries, keys = rotary_emb.rotate_queries_with_cached_keys(queries, keys)
+        else:
+            queries = rotary_emb.rotate_queries_or_keys(queries)
+            keys = rotary_emb.rotate_queries_or_keys(keys)
+
+
+        #print(f"keys shape: {keys.shape}")
+        #print(f"values shape: {values.shape}")
+        #print(f"queries shape: {queries.shape}")
+
+        #exit(10)
 
         # Calculate attention scores.
         attn_scores = queries @ keys.transpose(-2, -1)
@@ -218,17 +244,17 @@ class TransformerBlock(nn.Module):
     are used to stabilize training.
     """
 
-    def __init__(self, context_length, d_model, num_heads, dropout=0.0):
+    def __init__(self, context_length, d_model, num_heads, dropout=0.0, do_use_rotary_emb=False):
         super().__init__()
         head_size = d_model // num_heads
-        self.sa = CombinedMultiHeadAttention(context_length, d_model, head_size, num_heads, dropout)
+        self.sa = CombinedMultiHeadAttention(context_length, d_model, head_size, num_heads, dropout, do_use_rotary_emb)
         self.ffwd = FeedForward(d_model, dropout)
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
 
-    def forward(self, x, use_kv_cache=False):
+    def forward(self, x, use_kv_cache=False, rotary_emb=None):
         # Self-attention with a residual connection (x + ...)
-        x = x + self.sa(self.ln1(x), use_kv_cache=use_kv_cache)
+        x = x + self.sa(self.ln1(x), use_kv_cache=use_kv_cache, rotary_emb=rotary_emb)
         # Feed-forward network with a residual connection
         x = x + self.ffwd(self.ln2(x))
         return x
@@ -243,17 +269,22 @@ class VanillaGPT(nn.Module):
     A simple decoder-only Language Model (LLM) using multi-head self-attention.
     """
 
-    def __init__(self, vocab_size, context_length, d_model, num_heads, n_layer, dropout=0.0, device='cpu'):
+    def __init__(self, vocab_size, context_length, d_model, num_heads, n_layer, dropout=0.0, do_use_rotary_emb=False, device='cpu'):
         super().__init__()
         self.device = device
 
         # Embedding layers for tokens and their positions in the sequence.
         self.token_embedding_layer = nn.Embedding(vocab_size, d_model)
-        self.position_embedding_layer = nn.Embedding(context_length, d_model)
+        self.do_use_rotary_emb = do_use_rotary_emb
+
+        if self.do_use_rotary_emb is False:
+            self.position_embedding_layer = nn.Embedding(context_length, d_model)
+        else:
+            self.rotary_emb = RotaryEmbedding(dim=32)
 
         # A stack of Transformer blocks.
         self.blocks = nn.ModuleList(
-            [TransformerBlock(context_length, d_model, num_heads, dropout) for _ in range(n_layer)])
+            [TransformerBlock(context_length, d_model, num_heads, dropout, do_use_rotary_emb=do_use_rotary_emb) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(d_model)  # Final layer normalization
 
         # The final linear layer that maps the model's output to vocabulary logits.
@@ -268,36 +299,44 @@ class VanillaGPT(nn.Module):
         # Get token embeddings.
         tok_emb = self.token_embedding_layer(idx)  # (B, T, C)
 
-        # Get position embeddings.
-        if use_kv_cache and sequence_length == 1:
-            current_wrapped_position = self.current_pos % self.context_length
+        if self.do_use_rotary_emb is False:
+            # Get position embeddings.
+            if use_kv_cache and sequence_length == 1:
+                current_wrapped_position = self.current_pos % self.context_length
 
-            # For KV cache, only generate embeddings for new positions.
-            pos_ids = torch.tensor([current_wrapped_position], device=self.device, dtype=torch.long)
+                # For KV cache, only generate embeddings for new positions.
+                pos_ids = torch.tensor([current_wrapped_position], device=self.device, dtype=torch.long)
+            else:
+                pos_ids = torch.arange(0, sequence_length, device=self.device, dtype=torch.long)
+
+                if self.current_pos >= self.context_length:
+                    shift_amount = (self.current_pos % self.context_length) + 1
+
+                    # Roll pos ids with current position to have absolute positional embedding
+                    pos_ids = torch.roll(pos_ids, shifts=-shift_amount, dims=0)
+
+            # For first input (prompt) we need to increase by sequence length, then we assume one token is added each time
+            if self.current_pos == 0:
+                self.current_pos += sequence_length
+            else:
+                self.current_pos += 1
+
+            # print(f"sequence_length: {sequence_length}")
+            # print(f"context_length: {self.context_length}")
+            # print(f"pos_ids: {pos_ids}")
+            pos_emb = self.position_embedding_layer(pos_ids)  # (T, C)
+
+            x = tok_emb + pos_emb  # (B, T, C)
         else:
-            pos_ids = torch.arange(0, sequence_length, device=self.device, dtype=torch.long)
+            x = tok_emb
 
-            if self.current_pos >= self.context_length:
-                shift_amount = (self.current_pos % self.context_length) + 1
-
-                # Roll pos ids with current position to have absolute positional embedding
-                pos_ids = torch.roll(pos_ids, shifts=-shift_amount, dims=0)
-
-        # For first input (prompt) we need to increase by sequence length, then we assume one token is added each time
-        if self.current_pos == 0:
-            self.current_pos += sequence_length
-        else:
-            self.current_pos += 1
-
-        # print(f"sequence_length: {sequence_length}")
-        # print(f"context_length: {self.context_length}")
-        # print(f"pos_ids: {pos_ids}")
-        pos_emb = self.position_embedding_layer(pos_ids)  # (T, C)
-        x = tok_emb + pos_emb  # (B, T, C)
 
         # Pass through all Transformer blocks.
         for blk in self.blocks:
-            x = blk(x, use_kv_cache=use_kv_cache)
+            if self.do_use_rotary_emb is False:
+                x = blk(x, use_kv_cache=use_kv_cache)
+            else:
+                x = blk(x, use_kv_cache=use_kv_cache, rotary_emb=self.rotary_emb)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)

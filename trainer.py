@@ -107,14 +107,61 @@ class Trainer():
 
         self.m = self.m.to(self.device)
 
+        train_sequence_length = self.context_size + 20
+
         # training loop
         for steps in range(self.train_iters):
-            x_t, y_t = data_sampler(self.train_data, self.context_size, self.batch_size, self.device)  # x_t: (batch_size, context_size)
+            # x_t, y_t = data_sampler(self.train_data, self.context_size, self.batch_size, self.device)  # x_t: (batch_size, context_size)
+            x_t, y_t = data_sampler(self.train_data, train_sequence_length, self.batch_size, self.device)  # x_t: (batch_size, context_size)
+
+
+            self.m.reset_kv_cache()
+
+            #print(f"x_t: {x_t}")
+            #print(f"y_t: {y_t}")
+            #print(f"x_t shape: {x_t.shape}")
+            #print(f"y_t shape: {y_t.shape}")
+
+            logits = self.m(x_t[:, : self.context_size], use_kv_cache=True)
+
+            #print(f"logits shape: {logits.shape}")
+
+            for i in range(0, train_sequence_length - self.context_size):
+                x_i = x_t[:, self.context_size + i].unsqueeze(1)
+                logits_new = self.m(x_i, use_kv_cache=True)
+                #print(f"logits_new shape: {logits_new.shape}")
+
+                logits_new = logits_new[:, -1, :].unsqueeze(1)
+                #print(f"logits_new shape: {logits_new.shape}")
+
+                logits = torch.cat((logits, logits_new), dim=1)
+                #print(f"logits shape: {logits.shape}")
+
+            #exit(10)
+
+            # Todo:
+            # Problem: We only train the network with data of context size, can it even learn absolute positional embedding required to process sequences > context size?
+
+            #print(f"x_t.shape: {x_t.shape}")
+            #print(f"y_t.shape: {y_t.shape}")
+            #exit(10)
 
             # forward pass
-            logits = self.m(x_t)
+            #logits = self.m(x_t)
+
+            #print(f"logits: {logits}")
+            #print(f"logits shape: {logits.shape}")
+
             logits, targets = reshape_data(logits, y_t)
+
+            #print(f"logits: {logits}")
+            #print(f"logits shape: {logits.shape}")
+            #print(f"targets: {targets}")
+            #print(f"targets shape: {targets.shape}")
+
             loss = self.loss_function(logits, targets)
+
+            #exit(10)
 
             self.opt.zero_grad(set_to_none=True)
             loss.backward()

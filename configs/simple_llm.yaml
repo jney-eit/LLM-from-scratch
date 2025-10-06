@@ -1,11 +1,17 @@
 
 
+load_model: False
+model_load_name: "simple_gpt_kv_test_1"
+
+save_model: True
+model_save_name: "simple_gpt_kv_test"
+
 context_size: 256
 batch_size: 64
 loss_function: "CrossEntropy"
 optimizer: "AdamW"
 learning_rate: 3.0e-4
-train_iters: 5000
+train_iters: 2000   #5000
 eval_iters: 100
 d_model: 384
 num_heads: 6

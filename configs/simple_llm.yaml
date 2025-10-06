@@ -1,10 +1,10 @@
 
 
 load_model: False
-model_load_name: "simple_gpt_kv_test_1"
+model_load_name: "simple_gpt_rot_emb"
 
 save_model: True
-model_save_name: "simple_gpt_kv_test"
+model_save_name: "simple_gpt_rot_emb"
 
 context_size: 256
 batch_size: 64

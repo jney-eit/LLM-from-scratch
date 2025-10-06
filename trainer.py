@@ -111,13 +111,9 @@ class Trainer():
         for steps in range(self.train_iters):
             x_t, y_t = data_sampler(self.train_data, self.context_size, self.batch_size, self.device)  # x_t: (batch_size, context_size)
 
-            logits = self.m(x_t, use_kv_cache=True)
-
+            logits = self.m(x_t)
             logits, targets = reshape_data(logits, y_t)
-
             loss = self.loss_function(logits, targets)
-
-            #exit(10)
 
             self.opt.zero_grad(set_to_none=True)
             loss.backward()

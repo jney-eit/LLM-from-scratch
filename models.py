@@ -152,10 +152,6 @@ class CombinedMultiHeadAttention(nn.Module):
         queries_new = self.W_q(x)
         values_new = self.W_v(x)
 
-        #print(f"keys_new shape: {keys_new.shape}")
-        #print(f"queries_new shape: {queries_new.shape}")
-        #print(f"values_new shape: {values_new.shape}")
-
         if use_kv_cache:
             # If caching is enabled, append new keys and values to the stored cache.
             if self.cache_k is None:  # First pass (e.g., processing a prompt)
@@ -181,11 +177,6 @@ class CombinedMultiHeadAttention(nn.Module):
             queries = queries_new
 
 
-        #print(f"keys shape: {keys.shape}")
-        #print(f"values shape: {values.shape}")
-        #print(f"queries shape: {queries.shape}")
-
-
         q_len = queries.shape[1]
         kv_len = keys.shape[1]
 
@@ -200,19 +191,8 @@ class CombinedMultiHeadAttention(nn.Module):
             queries = rotary_emb.rotate_queries_or_keys(queries)
             keys = rotary_emb.rotate_queries_or_keys(keys)
 
-
-        #print(f"keys shape: {keys.shape}")
-        #print(f"values shape: {values.shape}")
-        #print(f"queries shape: {queries.shape}")
-
-        #exit(10)
-
         # Calculate attention scores.
         attn_scores = queries @ keys.transpose(-2, -1)
-
-        #print(f"mask shape: {self.mask.shape}")
-        #print(f"q_len: {q_len}")
-        #print(f"kv_len: {kv_len}")
 
         # Apply causal mask.
         if q_len > 1:
@@ -321,9 +301,6 @@ class VanillaGPT(nn.Module):
             else:
                 self.current_pos += 1
 
-            # print(f"sequence_length: {sequence_length}")
-            # print(f"context_length: {self.context_length}")
-            # print(f"pos_ids: {pos_ids}")
             pos_emb = self.position_embedding_layer(pos_ids)  # (T, C)
 
             x = tok_emb + pos_emb  # (B, T, C)
